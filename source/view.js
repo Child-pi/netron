@@ -1,6 +1,7 @@
 
 import * as base from './base.js';
 import * as grapher from './grapher.js';
+import * as macs from './macs.js';
 
 const view = {};
 const markdown = {};
@@ -3022,6 +3023,22 @@ view.NodeSidebar = class extends view.ObjectSidebar {
             for (const argument of metrics) {
                 this.addArgument(argument.name, argument, 'attribute');
             }
+        }
+
+        try {
+            const calculator = new macs.Calculator();
+            const value = calculator.calculate(node);
+            if (value) {
+                const metrics = (this._view.model.attachment && this._view.model.attachment.metrics) ?
+                    this._view.model.attachment.metrics.node(node) : [];
+                if (!Array.isArray(metrics) || metrics.length === 0) {
+                    this.addSection('Metrics');
+                }
+                const item = this.addProperty('MACs', value.toString(), 'bold');
+                item.element.title = 'Multiply-Accumulate Operations';
+            }
+        } catch (error) {
+            // ignore
         }
     }
 
