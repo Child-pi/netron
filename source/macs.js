@@ -15,73 +15,72 @@ macs.Calculator = class {
         // Check for PyTorch Conv2d, Linear
         // Check for ONNX Conv, Gemm, MatMul
 
-        if (type === 'Conv2d' || type === 'Conv' || type === 'Convolution' || type === 'Conv1d' || type === 'Conv3d') {
-            return this._computeConv2d(node);
-        } else if (type === 'Linear' || type === 'Gemm' || type === 'MatMul') {
+        // Handle "aten::conv2d", "Conv", etc.
+        const name = type.split('::').pop().toLowerCase();
+
+        if (name === 'conv2d' || name === 'conv' || name === 'convolution' || name === 'conv1d' || name === 'conv3d') {
+            return this._computeConv(node);
+        } else if (name === 'linear' || name === 'gemm' || name === 'matmul') {
             return this._computeLinear(node);
         }
 
         return null;
     }
 
-    _computeConv2d(node) {
+    _computeConv(node) {
         // PyTorch: input, weight, bias
         // ONNX: X, W, B
         const inputs = node.inputs;
-        const outputs = node.outputs;
 
-        if (inputs.length < 2 || outputs.length < 1) {
+        // inputs is array of Argument.
+        // Argument has value which is array of Value.
+        // Value has type -> shape.
+
+        if (!inputs || inputs.length < 2) {
             return null;
         }
 
-        // Assuming 2nd input is weight
+        // Assuming 2nd input is weight.
+        // In Netron, inputs are named. We can check names or just indices for common ops.
+        // PyTorch Conv2d: input, weight, bias
+        // ONNX Conv: X, W, B
+
+        // Input is usually index 0
+        // Weight is usually index 1
+
         const weight = this._getTensorShape(inputs[1]);
+        const outputs = node.outputs;
+        if (!outputs || outputs.length < 1) {
+            return null;
+        }
         const output = this._getTensorShape(outputs[0]);
 
         if (!weight || !output) {
             return null;
         }
 
-        // Weight shape: [OutChannels, InChannels/Groups, KernelH, KernelW] (PyTorch)
-        // ONNX: [M, C/group, kH, kW]
-
+        // Weight shape: [OutChannels, InChannels/Groups, KernelH, KernelW] (PyTorch/ONNX)
         // Output shape: [N, OutChannels, OutH, OutW]
 
         if (output.length < 3 || weight.length < 3) {
             return null;
         }
 
-        // Groups attribute
-        let groups = 1;
-        const attributes = node.attributes || [];
-        const groupAttr = attributes.find(a => a.name === 'groups' || a.name === 'group');
-        if (groupAttr) {
-            groups = parseInt(groupAttr.value, 10);
-        }
-
-        // MACs = OutputElements * (WeightElements / OutChannels)
-        // Or roughly: OutputN * OutputH * OutputW * OutChannels * (InChannels/Groups * KernelH * KernelW)
-        // Wait, WeightElements = OutChannels * InChannels/Groups * KernelH * KernelW
-        // So WeightElements / OutChannels = InChannels/Groups * KernelH * KernelW
-        // This is the number of MACs per output pixel per output channel.
-
-        // Total Output Elements = N * OutChannels * OutH * OutW
-
-        // So Total MACs = TotalOutputElements * (WeightElements / OutChannels) ?
-        // Let's verify.
-        // One output pixel (one channel) is result of dot product of Kernel sized volume.
-        // Kernel volume size = (InChannels/Groups) * KernelH * KernelW
-
-        // Correct.
-
-        // However, Weight shape[0] is usually OutChannels.
-        const outChannels = weight[0];
-        const weightElements = weight.reduce((a, b) => a * b, 1);
+        // Output elements count
         const outputElements = output.reduce((a, b) => a * b, 1);
+
+        // Weight elements count
+        const weightElements = weight.reduce((a, b) => a * b, 1);
+
+        // Weight[0] is typically OutChannels (or M for ONNX)
+        const outChannels = weight[0];
 
         if (outChannels === 0) return null;
 
+        // Kernel size per output channel = Total Weights / OutChannels
+        // This accounts for groups automatically.
         const kernelSize = weightElements / outChannels;
+
         const total = outputElements * kernelSize;
 
         return total;
@@ -95,52 +94,67 @@ macs.Calculator = class {
         const inputs = node.inputs;
         const outputs = node.outputs;
 
-        if (inputs.length < 2 || outputs.length < 1) {
+        if (!inputs || inputs.length < 2 || !outputs || outputs.length < 1) {
             return null;
         }
 
-        const input0 = this._getTensorShape(inputs[0]);
-        const input1 = this._getTensorShape(inputs[1]);
+        // const input0 = this._getTensorShape(inputs[0]);
+        const input1 = this._getTensorShape(inputs[1]); // Weight
         const output = this._getTensorShape(outputs[0]);
 
         if (!output) return null;
 
-        // For Linear layer: y = xA^T + b.
-        // x: [N, *, in_features]
-        // A: [out_features, in_features]
-        // y: [N, *, out_features]
+        // For Linear/Gemm/MatMul, simpler estimation:
+        // Output elements * "inner dimension size"
 
-        // MACs = OutputElements * in_features
-
+        // If we have weights (input1), we can infer the operation cost.
         if (input1) {
-            // Assume input1 is weight.
-            // For PyTorch Linear, weight is [out_features, in_features]
-            // in_features is input1[1].
+            // For PyTorch Linear: y = xA^T + b. A is [out_features, in_features]
+            // Output is [..., out_features]
+            // Each output element is a dot product of size in_features.
+            // in_features is A.shape[1] (if transposed) or A.shape[0] if not?
+            // PyTorch Linear weight is [out_features, in_features].
+            // ONNX Gemm B is typically [in, out] but transB attribute changes it.
 
-            // For MatMul [N, M] x [M, K] -> [N, K]
-            // MACs = N * K * M = OutputElements * M
-            // M is the common dimension.
+            // Heuristic:
+            // The operation is basically a dot product.
+            // If we assume standard matrix multiplication behavior involved in Linear/Dense layers.
+            // Weight matrix has N elements.
+            // Output matrix has M elements.
+            // If this is a simple Linear layer, Weight is [Out, In]. Output is [Batch, Out].
+            // MACs = Batch * Out * In = Output_Elements * In.
+            // In = Weight_Elements / Out = Weight_Elements / Output_Last_Dim.
 
-            // If we know it's a Linear layer where weights are constant and shape is known.
-            if (node.type.name === 'Linear') {
+            // Let's try to deduce 'In' dimension from Weight.
+            // If Weight is 2D [D1, D2].
+            // If node is Linear (PyTorch), weight is [OutFeatures, InFeatures].
+            // Output shape last dim is OutFeatures.
+
+            const name = node.type.name.split('::').pop().toLowerCase();
+
+            if (name === 'linear') {
                  if (input1.length >= 2) {
+                     // PyTorch Linear: weight is [out_features, in_features]
+                     // We count MACs.
                      const inFeatures = input1[1];
                      const outputElements = output.reduce((a, b) => a * b, 1);
                      return outputElements * inFeatures;
                  }
             }
 
-            if (node.type.name === 'Gemm' || node.type.name === 'MatMul') {
-                // Determine common dimension M.
-                // It is hard to be generic without knowing transposes etc.
-                // But usually for MatMul A(..., M) * B(M, ...), the MACs is OutputElements * M.
+            // For general MatMul/Gemm, it's harder without attributes (transA, transB).
+            // But usually one dimension matches.
 
-                // Let's try to infer M from inputs if shapes are available.
-                // MatMul: A[... M], B[M ...] -> Out
+            if (name === 'matmul' || name === 'gemm') {
+                // Approximate: Output elements * Common Dimension.
+                // Common Dimension can be estimated from weight size / output channel size?
+                // Or just use input0 last dim if available.
+
+                const input0 = this._getTensorShape(inputs[0]);
                 if (input0 && input0.length > 0) {
-                    const M = input0[input0.length - 1];
+                    const K = input0[input0.length - 1]; // Last dim of input
                     const outputElements = output.reduce((a, b) => a * b, 1);
-                    return outputElements * M;
+                    return outputElements * K;
                 }
             }
         }
@@ -148,37 +162,32 @@ macs.Calculator = class {
         return null;
     }
 
-    _getTensorShape(argument) {
-        if (!argument || !argument.value) return null;
+    _getTensorShape(parameter) {
+        // parameter is an Argument (view.js/model.js terminology)
+        // It has 'value' which is an array of Value objects.
+        if (!parameter || !parameter.value) return null;
 
-        let value = argument.value;
-        if (Array.isArray(value)) {
-            if (value.length === 0) return null;
-            value = value[0]; // Assume first tensor
-        }
+        // In view.js, node.inputs elements are Arguments.
+        // argument.value is array of Value objects.
 
-        if (!value || !value.type || !value.type.shape || !value.type.shape.dimensions) {
-            return null;
-        }
+        const values = parameter.value;
+        if (!Array.isArray(values) || values.length === 0) return null;
 
-        const dims = value.type.shape.dimensions;
+        const value = values[0];
+        // Value has 'type' which is a TensorType (usually)
+        if (!value || !value.type) return null;
 
-        // If dimensions contain non-numbers (e.g. '?'), we can't calculate exact MACs.
-        // But maybe we can treat '?' as 1 or ignore?
-        // Usually batch size is dynamic. If we treat it as 1, we get MACs per sample.
-        // But if user wants total MACs for the model inference as described by shapes...
+        const type = value.type;
+        if (!type.shape || !type.shape.dimensions) return null;
 
-        // "Mac數" usually implies for a single inference pass given the input shapes.
-        // If input shape has '?', we can't compute.
+        const dims = type.shape.dimensions;
 
-        // However, many models have fixed shapes or '?' for batch size.
-        // If I encounter '?', I will substitute 1 for batch dimension (usually first), or fail?
-        // Let's substitute 1 for any unknown dimension to provide an estimate per unit.
-
+        // Filter and sanitize dimensions
         const cleanDims = dims.map(d => {
             if (typeof d === 'number') return d;
             if (d && typeof d === 'object' && d.toNumber) return d.toNumber(); // Long.js
-            return 1; // Default to 1 for dynamic/unknown
+            // If string or null (dynamic), treat as 1 for estimation per unit batch/dynamic-dim
+            return 1;
         });
 
         return cleanDims;
