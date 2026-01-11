@@ -1,6 +1,7 @@
 
 import * as base from './base.js';
 import * as grapher from './grapher.js';
+import * as macs from './macs.js';
 
 const view = {};
 const markdown = {};
@@ -2343,6 +2344,13 @@ view.Node = class extends grapher.Node {
             }
             const item = list().argument(argument.name, content);
             list().add(item);
+        }
+        if (type !== 'graph') {
+            const macsValue = macs.Calculator.calculate(node);
+            if (macsValue) {
+                const item = list().argument('MACs', macs.Calculator.format(macsValue));
+                list().add(item);
+            }
         }
         if (Array.isArray(node.nodes) && node.nodes.length > 0) {
             // this.canvas = this.canvas();
