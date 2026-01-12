@@ -45,6 +45,9 @@ view.View = class {
             this._element('sidebar-target-button').addEventListener('click', () => {
                 this.showTargetProperties();
             });
+            this._element('export-excel-button').addEventListener('click', () => {
+                this.exportExcel();
+            });
             this._element('zoom-in-button').addEventListener('click', () => {
                 this.zoomIn();
             });
@@ -326,6 +329,131 @@ view.View = class {
                 this._target.register();
             }
         }
+    }
+
+    async exportExcel() {
+        if (!this.activeTarget || !this._model) {
+            return;
+        }
+
+        const graph = this.activeTarget;
+        const nodes = graph.nodes;
+        let calculator = null;
+        try {
+            calculator = new macs.Calculator();
+        } catch (err) {
+            // ignore
+        }
+
+        const data = [];
+        data.push(['OP Name', 'MACs', 'Input Width', 'Input Height', 'Input Channel', 'Output Width', 'Output Height', 'Output Channel', 'Pad Size', 'Weight Width', 'Weight Height']);
+
+        for (const node of nodes) {
+            const opName = node.type && node.type.name ? node.type.name : '';
+            let macsValue = '';
+            try {
+                if (calculator) {
+                    macsValue = calculator.calculate(node);
+                }
+            } catch (err) {
+                // ignore
+            }
+
+            let inputWidth = '';
+            let inputHeight = '';
+            let inputChannel = '';
+            let outputWidth = '';
+            let outputHeight = '';
+            let outputChannel = '';
+            let padSize = '';
+            let weightWidth = '';
+            let weightHeight = '';
+
+            const getShape = (arg) => {
+                if (arg && arg.value && arg.value.length > 0 && arg.value[0].type && arg.value[0].type.shape && arg.value[0].type.shape.dimensions) {
+                    return arg.value[0].type.shape.dimensions;
+                }
+                return null;
+            };
+
+            const inputShape = node.inputs && node.inputs.length > 0 ? getShape(node.inputs[0]) : null;
+            const outputShape = node.outputs && node.outputs.length > 0 ? getShape(node.outputs[0]) : null;
+
+            // Assuming NCHW or CHW
+            if (inputShape) {
+                if (inputShape.length === 4) {
+                    inputChannel = inputShape[1];
+                    inputHeight = inputShape[2];
+                    inputWidth = inputShape[3];
+                } else if (inputShape.length === 3) {
+                    inputChannel = inputShape[0];
+                    inputHeight = inputShape[1];
+                    inputWidth = inputShape[2];
+                }
+            }
+
+            if (outputShape) {
+                if (outputShape.length === 4) {
+                    outputChannel = outputShape[1];
+                    outputHeight = outputShape[2];
+                    outputWidth = outputShape[3];
+                } else if (outputShape.length === 3) {
+                    outputChannel = outputShape[0];
+                    outputHeight = outputShape[1];
+                    outputWidth = outputShape[2];
+                }
+            }
+
+            const getAttr = (name) => {
+                const attr = (node.attributes || []).find(a => a.name === name);
+                return attr ? attr.value : null;
+            };
+
+            const pads = getAttr('padding') || getAttr('pads') || getAttr('pad');
+            if (pads) {
+                if (Array.isArray(pads)) {
+                    padSize = pads.join(',');
+                } else {
+                    padSize = pads.toString();
+                }
+            }
+
+            const weightInput = (node.inputs || []).find(i => i.name && (i.name.toLowerCase().endsWith('weight') || i.name === 'W' || i.name === 'B'));
+            let weightShape = null;
+             if (weightInput) {
+                weightShape = getShape(weightInput);
+            } else if (node.inputs && node.inputs.length > 1) {
+                 // Check if second input is weight (initializer)
+                 const arg = node.inputs[1];
+                 if (arg.value && arg.value.length > 0 && arg.value[0].initializer) {
+                     weightShape = getShape(arg);
+                 }
+            }
+
+            if (weightShape && weightShape.length >= 2) {
+                weightHeight = weightShape[weightShape.length - 2];
+                weightWidth = weightShape[weightShape.length - 1];
+            }
+
+            data.push([
+                opName,
+                macsValue !== null ? macsValue : '',
+                inputWidth,
+                inputHeight,
+                inputChannel,
+                outputWidth,
+                outputHeight,
+                outputChannel,
+                `"${padSize}"`,
+                `"${weightWidth}"`,
+                `"${weightHeight}"`
+            ]);
+        }
+
+        const csvContent = data.map(e => e.join(",")).join("\n");
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const name = this._model.identifier ? this._model.identifier.split('/').pop().split('.').shift() : 'model';
+        await this._host.export(`${name}.csv`, blob);
     }
 
     toggle(name) {
